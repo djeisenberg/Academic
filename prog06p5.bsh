@@ -1,0 +1,149 @@
+#!/bin/bash
+
+# Daniel Eisenberg
+# C Sc 352 -- Systems Programming and UNIX
+# Fall 2011, Lester McCann
+# Program #6 Scripting's Last(?) Gasp;
+# Part 5: Create a Grading Script for prog04p3.c
+# Grader: Balaji Prasad
+
+# This Bash script verifies that a C program (as specified by the Program #4
+# handout) correctly generates candidate magic squares and correctly verifies
+# these candidate sqaures. This script only handles 3x3 square test cases.
+
+# This script should be invoked with the name of a C source code file supplied
+# as an argument. The filename need not include a .c extension, but the script
+# will only correctly function if the C file has the name format [filename].c.
+# Error messages will be generated as appropriate for missing or unreadable
+# source files, for compilation errors, and for incorrect program output.
+
+if [ $# -eq 0 ]; then
+    echo -e "Usage: $0 [filename]"
+    exit 3
+fi
+
+# check for .c extension
+cextension=`echo -e $1 | sed 's/.*\(\.c\)$/\1/'`
+
+if [ "$cextension" = ".c" ]; then
+    filename=$1
+else
+    filename=`echo -e "$1.c"`
+fi
+
+# compile program
+gcc $filename 2> /dev/null
+
+if (( $? )); then
+    echo -e "PROBLEM: $filename does not compile."
+    exit 4
+fi
+
+magicconst=15
+declare -a values
+declare -a sums
+
+# function prints appropriate problem message in case of non-magic square
+# which program claims is magic
+reportproblem() {   # arg1: problem location: 1-3 rows; 4-6 cols; 7,8 diags
+                    # arg2: value of sum
+    msg="PROBLEM: program says square is magic,"
+    if [ $1 -le 3 ]; then
+        echo "$msg but row $(($1-1)) = $2"
+    else if [ $1 -le 6 ]; then
+        echo "$msg but col $(($1-4)) = $2"
+    else if [ $1 -eq 7 ]; then
+        echo "$msg but main diagonal = $2"
+    else
+        echo "$msg"
+        echo "but upper-right-to-lower-left diagonal = $2"
+    fi
+    fi
+    fi
+}
+
+
+for i in 0 1 2 ; do
+    for j in 0 1 2 ; do
+        echo "Input 3 $i $j:"
+        output=`echo 3 $i $j | a.out`
+        claimmagic=1    # flag variable
+        problem=0       # flag variable
+        # check whether output contains "No"
+        if [[ "$output" == *No* ]]; then
+            claimmagic=0
+        fi
+
+        improperlygenerated=0 # flag variable
+        constant=0 # holds program's claimed magic constant value
+        for k in `seq 1 10` ; do
+            # make array of values
+            values[$k]=`echo $output | grep -o '[0-9]*' | sed -n ${k}p`
+            if [ $k -eq 10 ]; then
+                constant=`echo $output | grep -o '[0-9]*' | sed -n ${k}p`
+            else if [ ${values[$k]} -lt 1 -o ${values[$k]} -gt 9 ] ; then
+                # check values are between 1 and 9
+                improperlygenerated=1
+            fi
+            fi
+        done
+
+        # check correct magic constant reported
+        if [[ $constant -ne $magicconst ]]; then
+            mesg="PROBLEM: program says magic constant is $constant, "
+            echo "$mesg should be $magicconst"
+            problem=1
+        fi
+
+        # calculate sums
+        # row sums
+        for m in 1 2 3 ; do
+            index=1 # index of values to use
+            if [ $m -eq 2 ]; then
+                index=4
+            else if [ $m -eq 3 ]; then
+                index=7
+            fi
+            fi
+            sums[$m]=$((${values[$index]}+${values[$((index+1))]}+${values[$((index+2))]}))
+        done
+        # column sums
+        for m in 4 5 6 ; do
+            sums[$m]=$((${values[$m]}+${values[$((m+3))]}+${values[$((m-3))]}))
+        done
+        # diagonal sums
+        sums[7]=$(( ${values[1]}+${values[5]}+${values[9]} ))
+        sums[8]=$(( ${values[3]}+${values[5]}+${values[7]} ))
+
+        ismagic=1 # flag variable
+        falseindex=0 # holds index of a sum which is not 15, if applicable
+        for k in `seq 1 8` ; do
+            if [ ${sums[$k]} -ne $magicconst ]; then
+                ismagic=0
+                falseindex=$k
+            fi
+            # check square contains no duplicates
+            for m in `seq 1 9` ; do
+                if [ $m -ne $k -a ${values[$m]} -eq ${values[$k]} ]; then
+                    improperlygenerated=1
+                fi
+            done
+        done
+
+        if [ $improperlygenerated -eq 1 ]; then
+            problem=1
+            echo "PROBLEM: this square was improperly generated"
+        fi
+        if [ $ismagic -ne $claimmagic ]; then
+            if (( $ismagic )); then
+                echo "PROBLEM: program claims this magic square is not magic"
+            else # call function to print appropriate problem message
+                reportproblem $falseindex ${sums[$falseindex]}
+            fi
+        else if [ $problem -eq 0 ]; then
+            echo "OK"
+        fi
+        fi
+        echo ""
+    done
+done
