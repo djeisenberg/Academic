@@ -1,0 +1,269 @@
+package model.creatures;
+
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.List;
+
+import network.SafePlayer;
+
+import account.User;
+
+import model.items.Container;
+import model.items.Equipable;
+import model.items.Item;
+import model.items.ItemSlots;
+import model.items.Usable;
+import model.mechanics.Mechanics;
+import model.world.Room;
+
+/**
+ * Player class extends the abstract class Creature
+ * 
+ * @author Steven Chandler
+ * 
+ */
+public abstract class Player extends Creature implements SafePlayer{
+
+	private static final long serialVersionUID = 1L;
+
+	protected List<Item> inventory;
+	private EnumMap<ItemSlots, Equipable> equipped;
+	private transient List<Player> party;
+	private transient Player leader;
+	protected User user;
+	protected int xp;
+
+	protected Player(String name, User user) {
+		this.name = name;
+		this.user = user;
+		this.equipped = new EnumMap<ItemSlots, Equipable>(ItemSlots.class);
+		this.inventory = new ArrayList<Item>();
+		this.xp = 0;
+	}
+
+	/**
+	 * 
+	 * @param usable
+	 * 
+	 * @author Steven Chandler
+	 */
+	public void useItem(Usable usable) {
+
+	}
+
+	/**
+	 * 
+	 * @param abil
+	 * 
+	 * @author Steven Chandler
+	 * @param abilNumber 
+	 * @return 
+	 */
+	public int useAbility(String abil, Creature target) {
+		return 0;
+
+	}
+
+	/**
+	 * 
+	 * @param equipable
+	 * 
+	 * @author Steven Chandler
+	 */
+	public void equip(Equipable equipable) {
+		if (equipped.containsKey(ItemSlots.valueOf(equipable.getSlot())))
+			unequip(equipped.get(ItemSlots.valueOf(equipable.getSlot())));
+		equipped.put(ItemSlots.valueOf(equipable.getSlot()), equipable);
+		equipable.Equip(this);
+	}
+	
+	public void unequip(Equipable toRemove) {
+		equipped.remove(ItemSlots.valueOf(toRemove.getSlot()));
+		toRemove.Dequip(this);
+	}
+
+	/**
+	 * Static factory method returns a new instance of the appropriate subclass
+	 * based on Job enum.
+	 * 
+	 * @param name
+	 *            - the new character's name
+	 * @param job
+	 *            - the new character's job
+	 * @param user
+	 *            - the account for the new character
+	 * @return a new character of the appropriate job
+	 */
+	public static Player getNew(String name, Job job, User user) {
+		switch (job) {
+		// case BARD:
+		// return new Bard(name, user);
+		// break;
+		case BERSERKER:
+			return new Berserker(name, user);
+		case BLACK_MAGE:
+			return new BlackMage(name, user);
+		case KNIGHT:
+			return new Knight(name, user);
+		case MAGIC_KNIGHT:
+			return new MagicKnight(name, user);
+		case ROGUE:
+			return new Rogue(name, user);
+		case WHITE_MAGE:
+			return new WhiteMage(name, user);
+		default:
+			return null;
+		}
+	}
+
+	public String status() {
+		return null;
+	}
+
+	public List<Item> itemList() {
+		return inventory;
+	}
+
+	public void drop(Item item) {
+		if (inventory.remove(item))
+			location.drop(item);
+	}
+
+	public boolean take(Item item) {
+		if (location.take(item))
+			if (item instanceof Container) {
+				for (Item i : ((Container) item).getContents())
+					inventory.add(i);
+				return true;
+			}
+			else
+				return inventory.add(item);
+		return false;
+	}
+
+	public boolean receive(Item item) {
+		return inventory.add(item);
+	}
+
+	public boolean give(Item item, Player to) {
+		if (to.receive(item))
+			return inventory.remove(item);
+		else
+			return false;
+	}
+
+	public String inventory() {
+		String result = "";
+		for (Item i : inventory) {
+			result += i.getName();
+			if (i instanceof Equipable && equipped.containsValue(i))
+				result += " (equipped)";
+			result += "\n";
+			if (i instanceof Container) {
+				result += ((Container) i).inventory();
+			}
+		}
+		if (result.trim().equals(""))
+			return "You have no items.";
+		return result;
+	}
+
+	public List<Player> getParty() {
+		return party;
+	}
+
+	public void setParty(List<Player> party) {
+		this.party = party;
+	}
+
+	public boolean isLeader() {
+		return leader == null || this == leader;
+	}
+
+	public boolean hasParty() {
+		return party != null && party.size() > 1;
+	}
+
+	public abstract void LvlUp();
+
+	public void setLeader(Player lead) {
+		leader = lead;
+	}
+
+	public int getXP() {
+		return xp;
+	}
+
+	/**
+	 * This method adds the xp gained from a fight to the character. It then
+	 * checks to see if the character leveled and if yes, then adjusts the xp,
+	 * level, and calls the class LvlUp function
+	 * 
+	 * @param defender
+	 *            - the defending creature
+	 * 
+	 * @author Steven Chandler
+	 */
+	public boolean setXP(Creature defender) {
+		int x = 0;
+		if (hasParty()) { // get party average level
+			for (Player p : party)
+				x += p.getLevel();
+			x /= party.size();
+		} else
+		x = Mechanics.calculateXP(this.level, defender.getLevel());
+		
+		if(defender instanceof Boss)
+			x *= 2;
+		
+		xp = xp + x;
+		if (Mechanics.didLevel(this.level, this.xp)) {
+			xp = xp - Mechanics.xpTable.get(level);
+			level++;
+			this.LvlUp();
+			this.currenthp = this.hp;
+			this.currentmp = this.mp;
+			return true;
+		}
+		return false;
+	}
+
+	public int attack(Creature c) {
+		return Mechanics.physicalDamage(this, c, Mechanics.Attack(this, c));
+	}
+
+	/**
+	 * Checks if player knows the specified ability.
+	 * 
+	 * @param abilityKey - an ability key, such as Kni001
+	 * @return true if this player knows the ability.
+	 */
+	public boolean knowsAbility(String abilityKey) {
+		return abilities.containsKey(abilityKey);
+	}
+
+	/**
+	 * Returns the name of an ability by its key.
+	 * 
+	 * @param abilityKey - an ability key.
+	 * @return the name of the ability.
+	 */
+	public String getAbilityName(String abilityKey) {
+		return abilities.get(abilityKey);
+	}
+
+	public String getAbilities() {
+		return null;
+	}
+
+	/* (non-Javadoc)
+	 * @see model.creatures.Creature#setRoom(model.world.Room)
+	 */
+	public void setRoom(Room room) {
+		if (this.location != null)
+			location.removePlayer(this);
+		this.location = room;
+		room.addPlayer(this);
+	}
+
+}

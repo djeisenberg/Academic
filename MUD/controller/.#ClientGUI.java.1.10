@@ -1,0 +1,260 @@
+package controller;
+
+import java.awt.BorderLayout;
+import java.awt.GridLayout;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+import java.util.Arrays;
+import java.util.Observable;
+import java.util.Observer;
+
+import javax.swing.JButton;
+import javax.swing.JComboBox;
+import javax.swing.JFrame;
+import javax.swing.JLabel;
+import javax.swing.JOptionPane;
+import javax.swing.JPanel;
+import javax.swing.JPasswordField;
+import javax.swing.JScrollPane;
+import javax.swing.JTextArea;
+import javax.swing.JTextField;
+import javax.swing.ScrollPaneConstants;
+
+import model.creatures.Job;
+import network.Packet;
+import network.Type;
+
+/**
+ * GUI for the client. For now it will only have the Chat and System windows
+ * 
+ * @author james_carpenter
+ * 
+ */
+public class ClientGUI extends JFrame implements Observer {
+
+	private static final long serialVersionUID = 1L;
+
+	private ClientModel clientModel;
+
+	private JTextArea chatWindow, systemWindow;
+	private JTextField messageInputField;
+	private JButton messageSendButton;
+	private JScrollPane chatScrollPane, systemScrollPane;
+
+	public ClientGUI() {
+		this.setLayout(null);
+		this.setSize(615, 500);
+		this.setTitle("MUD_CLIENT");
+
+		chatWindow = new JTextArea();
+		chatWindow.setSize(300, 300);
+		chatWindow.setLocation(5, 5);
+		chatWindow.setEditable(false);
+		chatWindow.setLineWrap(true);
+		chatWindow.setVisible(true);
+
+		chatScrollPane = new JScrollPane(chatWindow,
+				ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED,
+				ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+		chatScrollPane.setSize(300, 300);
+		chatScrollPane.setLocation(5, 5);
+		chatScrollPane.setVisible(true);
+
+		messageInputField = new JTextField();
+		messageInputField.setSize(605, 25);
+		messageInputField.setLocation(5, 310);
+
+		messageSendButton = new JButton("Send Message");
+		messageSendButton.setLocation(5, 345);
+		messageSendButton.setSize(200, 25);
+		messageSendButton.addActionListener(new SendMessageToServerListener());
+
+		systemWindow = new JTextArea();
+		systemWindow.setSize(300, 300);
+		systemWindow.setEditable(false);
+		systemWindow.setLineWrap(true);
+		systemWindow.setVisible(true);
+
+		systemScrollPane = new JScrollPane(systemWindow,
+				ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED,
+				ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+		systemScrollPane.setSize(300, 300);
+		systemScrollPane.setLocation(310, 5);
+		systemScrollPane.setVisible(true);
+
+		this.add(chatScrollPane);
+		this.add(systemScrollPane);
+		this.add(messageInputField);
+		this.add(messageSendButton);
+
+		this.setVisible(true);
+		this.setDefaultCloseOperation(EXIT_ON_CLOSE);
+
+		clientModel = new ClientModel();
+		clientModel.addObserver(this);
+		clientModel.connectToServer(JOptionPane.showInputDialog(this,
+				"Enter IP"), Integer.parseInt(JOptionPane.showInputDialog(this,
+				"Enter Port")));
+
+		// TODO: new account selector. And make it look more pretty.
+		// currently disabled entirely.
+		while (!makeLoginPacket())
+			;
+		if (!finishLogin()) {
+			clientModel.disconnectFromServer();
+			return;
+		} else {
+			clientModel.startInputThread();
+		}
+	}
+
+	// clientModel.logIn(true, JOptionPane.showInputDialog(this,
+	// "Enter Username"), JOptionPane.showInputDialog(this,
+	// "Enter Password").toCharArray());
+
+	private boolean makeLoginPacket() {
+		JPanel pw = new JPanel();
+		pw.setLayout(new GridLayout(2, 2));
+		pw.add(new JLabel("Username: "));
+		JTextField nameField = new JTextField(10);
+		pw.add(nameField);
+		pw.add(new JLabel("Password: "));
+		JPasswordField pwField = new JPasswordField(10);
+		pw.add(pwField);
+
+		String[] opt = { "Login", "New account" };
+		// new account
+		if (JOptionPane.showOptionDialog(this, pw,
+				"Enter username and password.", JOptionPane.DEFAULT_OPTION,
+				JOptionPane.PLAIN_MESSAGE, null, opt, opt[0]) == 1) {
+			JPasswordField pwf2 = new JPasswordField(10);
+			JOptionPane.showMessageDialog(this, pwf2, "Confirm password.",
+					JOptionPane.PLAIN_MESSAGE);
+			if (Arrays.equals(pwField.getPassword(), pwf2.getPassword())) {
+				clientModel.logIn(true, nameField.getText(),
+						pwField.getPassword());
+				return true;
+			} else
+				return false;
+		} else { // login (existing account)
+			return clientModel.logIn(false, nameField.getText(),
+					pwField.getPassword());
+		}
+	}
+
+	private boolean finishLogin() {
+		network.Packet packet = clientModel.nextLoginPacket();
+		if (packet.getType() != Type.CHARACTER_SELECT)
+			packetPopup(packet);
+		if (packet.getType() == Type.CHARACTER_SELECT)
+			return selectCharacter(packet);
+		else if (packet.getType() == Type.SERVER_MESSAGE)
+			return createCharacter();
+		return false;
+	}
+
+	private boolean selectCharacter(Packet packet) {
+		String[] characters = Packet.getArray(packet);
+		String[] options = { "Select character", "Delete character",
+				"Create character" };
+		JComboBox box = new JComboBox(characters);
+		int command = JOptionPane.showOptionDialog(this, box,
+				"Select character", JOptionPane.DEFAULT_OPTION,
+				JOptionPane.PLAIN_MESSAGE, null, options, options[0]);
+		String choice = box.getSelectedItem().toString();
+		if (command == 1) // delete
+			if (JOptionPane.NO_OPTION == JOptionPane.showConfirmDialog(this,
+					"Are you sure you want to delete " + choice + "?"))
+				return selectCharacter(packet); // cancelled delete
+			else {
+				clientModel.sendAccountPacket(new Packet(Type.DELETE_CHARACTER,
+						choice)); // confirmed delete
+				return finishLogin();
+			}
+		else if (command == 0) { // selected character
+			clientModel.sendAccountPacket(new Packet(Type.CHARACTER_SELECT,
+					choice));
+			Packet p = clientModel.nextLoginPacket();
+			if (p.getType() == Type.ERROR)
+				packetPopup(p);
+			return p.getType() != Type.ERROR;
+		} else
+			// create new character
+			return createCharacter();
+	}
+
+	private boolean createCharacter() {
+		model.creatures.Job[] jobs = model.creatures.Job.values();
+		JComboBox box = new JComboBox(jobs);
+		String name = JOptionPane.showInputDialog(this, "Name Character");
+		if (name == null)
+			return false;
+		JOptionPane.showMessageDialog(this, box, "Choose job",
+				JOptionPane.PLAIN_MESSAGE);
+		clientModel.sendAccountPacket(new Packet(Type.CREATE_CHARACTER, name
+				+ " " + box.getSelectedItem()));
+		Packet packet = clientModel.nextLoginPacket();
+		packetPopup(packet);
+		if (packet.getType() == Type.SERVER_MESSAGE)
+			return true;
+		return createCharacter();
+	}
+
+	public void packetPopup(Packet p) {
+		boolean error = p.getType() == Type.ERROR;
+		JOptionPane.showMessageDialog(this, p.getMessage(), error ? "Error"
+				: "Login information", error ? JOptionPane.ERROR_MESSAGE
+				: JOptionPane.PLAIN_MESSAGE);
+	}
+
+	private class SendMessageToServerListener implements ActionListener {
+
+		@Override
+		public void actionPerformed(ActionEvent e) {
+			try {
+				if (clientModel.sendPacketToServer(messageInputField.getText()
+						.trim())) {
+					messageInputField.setText(null);
+					return;
+				} else {
+					messageInputField
+							.setText("ERROR: could not communicate with server. Please try again");
+					messageInputField.selectAll();
+				} // else notify user of the failure to send packet
+			} catch (NullPointerException npe) {
+				// no action required when user clicks send and the text input
+				// field is empty
+			}
+		}
+	}
+
+	/**
+	 * When a packet is received, write the message to the appropriate window.
+	 * 
+	 * @param o
+	 *            the clientModel
+	 * @param arg
+	 *            type network.Packet, received from the server
+	 */
+	@Override
+	public void update(Observable o, Object arg) {
+		network.Packet packet = (network.Packet) arg;
+		String msg = packet.getMessage() + "\n";
+		if (packet.getType() == network.Type.TELL)
+			chatWindow.append(msg);
+		else if (packet.getType() == network.Type.SAY)
+			chatWindow.append(msg);
+		else if (packet.getType() == network.Type.MOVE)
+			systemWindow.append(msg); // update player's view to
+										// show that they are in
+										// a new room.
+		else if (packet.getType() == network.Type.SERVER_BROADCAST)
+			systemWindow.append(msg);
+		else if (packet.getType() == network.Type.SERVER_MESSAGE)
+			systemWindow.append(msg);
+		// TODO: the rest of the commands
+
+		else
+			systemWindow.append(msg); // for now.
+	}
+}

@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Daniel Eisenberg
+# execution script for fractal program using openmpi
+
+output="output"         # output file
+hostfile="hosts"        # hostfile for mpi
+controller="fractal"    # view/controller program (single instance)
+task="fractalcalc"      # computation program (distributed)
+defaultnp="8"           # default # instances of task
+master="lectura"        # host to run $controller on
+
+if [ $# -gt 0 ]; then
+    np=$1
+else
+    np=$defaultnp
+fi
+
+if [ ! -r $hostfile ]; then
+    echo "$hostfile not found"
+    exit 1
+fi
+
+(make all)
+
+mpirun --np 1 --host $master $controller : --hostfile $hostfile -np $np $task "$@"

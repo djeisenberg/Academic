@@ -1,0 +1,9 @@
+# fractal hostfile
+# mpirun --hostfile hosts
+lectura max-slots=1
+harpoon slots=8
+harvill slots=8
+harlequin slots=8
+harvey slots=8
+harvard slots=8
+harquebus slots=8

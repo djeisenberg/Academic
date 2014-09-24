@@ -1,0 +1,1081 @@
+package server;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.PrintStream;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Scanner;
+import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.LinkedBlockingQueue;
+
+import exceptions.ServerFileException;
+
+import account.User;
+
+import model.creatures.Job;
+import model.creatures.Mob;
+import model.creatures.Player;
+import model.mechanics.Mechanics;
+import model.world.Dungeon;
+import model.world.Room;
+import model.world.World;
+import network.LoginPacket;
+import network.Packet;
+import network.Type;
+
+/**
+ * Server class contains main method for MUD server.
+ * 
+ * 
+ * @author Daniel Eisenberg
+ */
+public class Server {
+
+	/**
+	 * This is the port Server will listen for connections on.
+	 */
+	private static final int PORT = 4000;
+	private ServerSocket serverSocket;
+
+	private boolean restart;
+	private boolean shuttingDown;
+	private boolean shutdownCommand;
+
+	static ConcurrentMap<Player, Connection> connections;
+	static ConcurrentMap<String, Player> playerLookup; // lookup table for
+														// player by name
+	static ConcurrentMap<String, User> usersOnline; // lookup table for user by
+													// name
+	private static BlockingQueue<Command> eventQueue;
+
+	private boolean threadFinished; // flag tells main thread when at least one
+									// thread should be dereferenced
+	private List<ListenerThread> inputThreads;
+	private List<ReporterThread> outputThreads;
+	private EventThread eventThread;
+	private Thread mobActionThread;
+	private Thread shutdownThread;
+	private ConsoleThread consoleThread;
+
+	private Set<String> userList;
+	private Set<String> characterNameList;
+	private Set<String> ipBanList;
+	private Set<String> banList;
+
+	private World world;
+
+	private static final String PATH = "serverfiles";
+	private File usersFile;
+	private File characterNameFile;
+	private File ipBanFile;
+	private File banFile;
+
+	private File errorLog;
+	private PrintStream err;
+
+	private static final String LOG_NAME = "error.txt";
+
+	public static void main(String[] args) {
+		Server server = new Server();
+		while (server.restart)
+			server = new Server();
+		System.exit(0);
+	}
+
+	/**
+	 * Initializes non-persistent server objects.
+	 * 
+	 */
+	private Server() {
+		restart = false;
+		shuttingDown = false;
+		shutdownCommand = false;
+		threadFinished = false;
+
+		// Route System.err to log file
+		errorLog = new File(PATH, LOG_NAME);
+		try {
+			if (!errorLog.isFile()) {
+				errorLog.getParentFile().mkdirs();
+			} else {
+				File prev = new File(PATH, "prevlog.txt");
+				if (prev.isFile())
+					prev.delete();
+				errorLog.renameTo(prev);
+			}
+			errorLog.createNewFile();
+			err = new PrintStream(errorLog);
+			System.setErr(err);
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+
+		// build Mechanics static tables
+		new Mechanics();
+
+		// open server socket
+		try {
+			serverSocket = new ServerSocket(PORT);
+		} catch (IOException e) {
+			e.printStackTrace();
+			System.out
+					.println("Unable to create server socket on port " + PORT);
+			System.exit(1);
+		}
+
+		// initialize tables
+		connections = new ConcurrentHashMap<Player, Connection>();
+		playerLookup = new ConcurrentHashMap<String, Player>();
+		usersOnline = new ConcurrentHashMap<String, User>();
+
+		// initialize thread reference lists
+		// note: these are only intended to prevent garbage collection of active
+		// threads, they are not intended to be accessed by anything but the
+		// eventThread
+		inputThreads = new LinkedList<ListenerThread>();
+		outputThreads = new LinkedList<ReporterThread>();
+
+		// setup eventThread and eventQueue, start eventThread
+		eventThread = new EventThread();
+		eventQueue = new LinkedBlockingQueue<Command>();
+		eventThread.start();
+
+		// initialize mobActionThread
+		// mobActionThread = new MobActionThread();
+
+		startup();
+	}
+
+	/**
+	 * Loads files to support Server and begins listen loop.
+	 */
+	private void startup() {
+		// initialize File objects
+		usersFile = new File(PATH, "userList.dat");
+		characterNameFile = new File(PATH, "characterNameList.dat");
+		ipBanFile = new File(PATH, "ipBanList.dat");
+		banFile = new File(PATH, "banList.dat");
+
+		userList = loadListFile(usersFile);
+		characterNameList = loadListFile(characterNameFile);
+		ipBanList = loadListFile(ipBanFile);
+		banList = loadListFile(banFile);
+
+		loadWorld();
+
+		mobActionThread.start();
+
+		// start consoleThread
+		consoleThread = new ConsoleThread();
+		consoleThread.start();
+
+		listen();
+	}
+
+	@SuppressWarnings("unchecked")
+	private Set<String> loadListFile(File file) {
+		try {
+			Set<String> set;
+			FileInputStream fis = new FileInputStream(file);
+			ObjectInputStream ois = new ObjectInputStream(fis);
+			set = (Set<String>) ois.readObject();
+			ois.close();
+			fis.close();
+			if (set != null)
+				return set;
+			return new ConcurrentSkipListSet<String>();
+		} catch (FileNotFoundException e) {
+			System.out.println("No file exists: " + file.getPath());
+			return new ConcurrentSkipListSet<String>();
+		} catch (IOException e) {
+			e.printStackTrace();
+			throw new ServerFileException("Could not load " + file.getPath());
+		} catch (ClassNotFoundException e) {
+			e.printStackTrace();
+			throw new ServerFileException("Could not load " + file.getPath());
+		}
+	}
+
+	/**
+	 * Loads the server's World file.
+	 */
+	private void loadWorld() {
+		FileInputStream fis;
+		ObjectInputStream ois;
+		try {
+			fis = new FileInputStream(new File(PATH, "world.dat"));
+			ois = new ObjectInputStream(fis);
+			world = (World) ois.readObject();
+			ois.close();
+			fis.close();
+		} catch (IOException e) {
+			e.printStackTrace();
+			// TODO add builder call
+			throw new ServerFileException("Could not load world.");
+		} catch (ClassNotFoundException e) {
+			e.printStackTrace();
+			throw new ServerFileException("Could not load world.");
+		}
+	}
+
+	/**
+	 * Server main loop. Listens for connections on PORT and starts threads to
+	 * handle them.
+	 * 
+	 */
+	private void listen() {
+		System.out.println("Listening for connections on port " + PORT + ".");
+		while (true) {
+			try {
+				Socket socket = serverSocket.accept();
+				if (ipBanList.contains(socket.getInetAddress().toString()))
+					continue;
+				Connection c = new Connection(socket);
+
+				// start threads for this connection
+				Thread thread = new ListenerThread(c);
+				thread.start();
+				inputThreads.add((ListenerThread) thread);
+
+				thread = new ReporterThread(c);
+				thread.start();
+				outputThreads.add((ReporterThread) thread);
+			} catch (IOException e) {
+				e.printStackTrace();
+			} finally {
+				if (shuttingDown) {
+					shuttingDown = false;
+					shutdown();
+					return;
+				}
+			}
+			// remove unneeded threads
+			if (threadFinished) {
+				for (ListenerThread t : inputThreads)
+					if (!t.needed)
+						inputThreads.remove(t);
+				for (ReporterThread t : outputThreads)
+					if (t.done)
+						outputThreads.remove(t);
+				// reset flag
+				threadFinished = false;
+			}
+		}
+	}
+
+	/**
+	 * Tells all threads to cease activity, all persistent data written to file.
+	 */
+	private void shutdown() {
+
+		endThreads();
+
+		saveFile(usersFile, userList);
+		saveFile(characterNameFile, characterNameList);
+		saveFile(ipBanFile, ipBanList);
+		saveFile(banFile, banList);
+
+		err.close();
+		while (!okayToExit())
+			; // ListenerThreads may be writing to file.
+		return;
+	}
+
+	private boolean okayToExit() {
+		for (ListenerThread t : inputThreads)
+			if (t.needed)
+				return false;
+		return true;
+	}
+
+	/**
+	 * Saves the specified object to the specified file.
+	 * 
+	 * @param file
+	 *            - the destination file
+	 * @param toSave
+	 *            - the object to be written
+	 */
+	private void saveFile(File file, Object toSave) {
+		FileOutputStream fos;
+		ObjectOutputStream oos;
+		try {
+			if (!file.isFile())
+				file.createNewFile();
+			else {
+				File backup = new File(PATH, file.getName() + ".bak");
+				if (backup.isFile())
+					backup.delete(); // remove old backup file
+				file.renameTo(backup);
+			}
+			fos = new FileOutputStream(file);
+			oos = new ObjectOutputStream(fos);
+			oos.writeObject(toSave);
+			oos.close();
+			fos.close();
+		} catch (IOException e) {
+			e.printStackTrace();
+			try { // make second attempt
+				if (!file.isFile())
+					file.createNewFile();
+				fos = new FileOutputStream(file);
+				oos = new ObjectOutputStream(fos);
+				oos.writeObject(toSave);
+				oos.close();
+				fos.close();
+			} catch (IOException e1) {
+				e1.printStackTrace();
+				System.out.println("Could not write " + file.getName() + "!");
+			}
+		}
+	}
+
+	/**
+	 * Tells all connection threads to close their connections and save data.
+	 */
+	private void endThreads() {
+		for (ListenerThread t : inputThreads) {
+			t.end();
+		}
+
+		for (ReporterThread t : outputThreads) {
+			t.end();
+		}
+	}
+
+	/**
+	 * Places a Command on the eventQueue.
+	 * 
+	 * @param event
+	 *            - the Command to be executed.
+	 * @throws InterruptedException
+	 */
+	public void queueEvent(Command event) throws InterruptedException {
+		eventQueue.put(event);
+	}
+
+	/**
+	 * ListenerThreads handle client handshaking and route client commands.
+	 * 
+	 * start() logs in client creating new user and/or player as necessary.
+	 * 
+	 * @author Daniel Eisenberg
+	 */
+	private class ListenerThread extends Thread {
+
+		private Connection connection;
+		private boolean done;
+		private boolean needed;
+
+		/**
+		 * Creates a new ListenerThread with the specified Connection.
+		 * 
+		 * @param c
+		 *            - the connection for this ListenerThread
+		 * 
+		 */
+		public ListenerThread(Connection c) {
+			super();
+			connection = c;
+			needed = true;
+		}
+
+		/**
+		 * ListenerThread will handle login before entering main loop to receive
+		 * commands.
+		 * 
+		 */
+		public void run() {
+			try {
+				login();
+				// TODO: Room logistics
+				// connection.player.setRoom();
+
+				// TODO: write character loaded message
+				// (with status update?)
+			} catch (IOException e1) {
+				e1.printStackTrace();
+			} catch (ClassNotFoundException e1) {
+				e1.printStackTrace();
+			}
+			while (!done) {
+				try {
+					Packet command = (Packet) connection.ois.readObject();
+
+					if (command == null) {// client disconnected
+						end();
+						break;
+					}
+
+					sort(command);
+				} catch (IOException e) {
+					e.printStackTrace();
+				} catch (ClassNotFoundException e) {
+					e.printStackTrace();
+				} catch (InterruptedException e) {
+					interrupt();
+				} finally {
+					if (isInterrupted())
+						interrupted();
+				}
+			}
+			cleanup();
+		}
+
+		/**
+		 * Determines an action for the server to take based upon the content of
+		 * the packet argument and adds this action to the eventQueue if needed.
+		 * 
+		 * @param packet
+		 *            - the Packet to be converted to a Command.
+		 * @throws IOException
+		 */
+		private void sort(Packet packet) throws IOException,
+				InterruptedException {
+			String msg = packet.getMessage();
+			switch (packet.getType()) {
+			case ACTION: // TODO
+				break;
+			case LOGOUT:
+				connection.outputQueue.put(Packet.LOGOUT_MESSAGE);
+				connection.outputQueue.put(Packet.POISON);
+				cleanup();
+				break;
+			case MOVE:
+				// TODO determine where party movement code is handled
+				// Room currentRoom = connection.player.getRoom();
+				switch (msg.charAt(0)) {
+				case 'n':
+					break;
+				case 's':
+					break;
+				case 'w':
+					break;
+				case 'e':
+					break;
+				case 'u':
+					break;
+				case 'd':
+					break;
+				default:
+					invalidCommand();
+				}
+				// eventQueue.put(new MoveCommand(connection.player,
+				// currentRoom));
+				break;
+			case OOC: // broadcast ooc chat message
+				eventQueue.put(new Broadcast(new Packet(Type.OOC,
+						connection.player.getName() + ": " + msg)));
+				break;
+			case PARTY: // send chat message to each party member
+				// TODO
+				// if (connection.player.getParty().size() > 1)
+				// eventQueue.put(new PartyCommand(connection.player, msg));
+				// else
+				// connection.outputQueue.put(new Packet(Type.ERROR,
+				// "You are not in a party."));
+				break;
+			case SAY:
+				eventQueue.put(new RoomCommand(connection.player,
+						connection.player.getName() + " says: " + msg, packet
+								.getType()));
+				break;
+			case SERVER_MESSAGE:
+				// not currently used for any incoming packets
+				invalidCommand();
+				break;
+			case SOCIAL: // emote or similar
+				eventQueue.put(new RoomCommand(connection.player,
+						connection.player.getName() + " " + msg, packet
+								.getType()));
+				break;
+			case TELL: // sends a private message
+				if (msg.indexOf(' ') == -1) {
+					invalidCommand();
+					break;
+				}
+				String message = msg.substring(msg.indexOf(' ') + 1);
+				String target = msg.substring(0, msg.indexOf(' '));
+				target = Names.formatName(target);
+				if (playerLookup.get(target) != null)
+					eventQueue.put(new TellCommand(connection.player,
+							playerLookup.get(target), message));
+				else
+					connection.outputQueue.put(new Packet(Type.ERROR, target
+							+ "not found."));
+				break;
+			case BAN_IP: // moderation commands
+			case BAN:
+			case KICK:
+				if (!connection.user.isModerator())
+					connection.outputQueue.put(Packet.NO_PERMISSION);
+				else {
+					Type which = packet.getType();
+					Player who = playerLookup.get(msg);
+					if (who != null && moderate(which, who))
+						connection.outputQueue.put(new Packet(
+								Type.SERVER_MESSAGE, msg
+										+ " has been moderated."));
+				}
+				break;
+			case RESTART: // a moderator can order server shutdown or restart
+							// remotely
+			case SHUTDOWN:
+				if (connection.user.isModerator()) {
+					int time = 0;
+					if (!msg.equals(""))
+						try {
+							time = Integer.parseInt(msg);
+						} catch (NumberFormatException nfe) {
+							invalidCommand();
+						}
+					if (!shutdownCommand)
+						eventQueue.put(new ShutdownCommand(time, (packet
+								.getType() == Type.RESTART)));
+					else
+						connection.outputQueue.put(Packet.SHUTDOWN_IN_PROGRESS);
+				} else {
+					connection.outputQueue.put(Packet.NO_PERMISSION);
+				}
+				break;
+			default:
+				invalidCommand();
+				break;
+			}
+		}
+
+		/**
+		 * Handles banbyip, ban, and kick commands from users with moderation
+		 * privileges.
+		 * 
+		 * @param which
+		 *            - the moderation Type: BAN_IP, BAN, or KICK. <br>
+		 * <br>
+		 *            A BAN_IP request is also a BAN request, <br>
+		 *            a BAN action is also a KICK request, <br>
+		 *            KICK removes the specified user from the server without
+		 *            enacting any bans. <br>
+		 * <br>
+		 * @param who
+		 *            - the Player belonging to the User who is to be moderated.
+		 * @return true if the player was successfully moderated.
+		 * @throws InterruptedException
+		 */
+		private boolean moderate(Type which, Player who)
+				throws InterruptedException {
+			Connection c = connections.get(who);
+			String message = "You have been ";
+			if (c == null) {
+				// banning remotely requires player to be online
+				// otherwise write to appropriate serverfiles file
+				return false;
+			}
+			if (which == Type.BAN_IP) {
+				ipBanList.add(c.socket.getInetAddress().toString());
+			}
+			if (which != Type.KICK) {
+				banList.add(c.user.getUsername());
+				message += "banned ";
+			} else
+				message += "kicked ";
+			message += "from the server.";
+			c.outputQueue.put(new Packet(Type.SERVER_MESSAGE, message));
+			c.outputQueue.put(Packet.POISON);
+			try {
+				c.socket.close();
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+			return true;
+		}
+
+		/**
+		 * Enqueues an invalid command packet.
+		 * 
+		 * @throws InterruptedException
+		 */
+		private void invalidCommand() throws InterruptedException {
+			connection.outputQueue.put(Packet.INVALID_COMMAND);
+		}
+
+		/**
+		 * Client login including new account creation.
+		 * 
+		 * @throws ClassNotFoundException
+		 * @throws IOException
+		 */
+		private void login() throws IOException, ClassNotFoundException {
+			LoginPacket loginPacket = (LoginPacket) connection.ois.readObject();
+			boolean success = false;
+			do {
+				switch (loginPacket.getType()) {
+				case NEW_ACCOUNT:
+					// try to create a new account with the specified name
+					if (userList.contains(loginPacket.getUsername())) {
+						connection.oos.writeObject(new Packet(Type.ERROR,
+								"That username is taken."));
+					} else { // create new user
+						connection.user = new User(loginPacket.getUsername());
+						connection.user.setPassword(loginPacket.getPassword());
+						userList.add(connection.user.getUsername());
+						usersOnline.put(connection.user.getUsername(),
+								connection.user);
+						success = true;
+					}
+					break;
+
+				case LOGIN:
+					if (userList.contains(loginPacket.getUsername())
+							&& !usersOnline.containsKey(loginPacket
+									.getUsername())) {
+						connection.user = User.load(loginPacket.getUsername());
+					}
+					// check loaded and check password
+					if (connection.user != null
+							&& connection.user.checkPassword(loginPacket
+									.getPassword())) {
+						usersOnline.put(connection.user.getUsername(),
+								connection.user);
+						success = true;
+					} else {
+						connection.oos.writeObject(Packet.LOGIN_FAILED);
+					}
+					break;
+
+				default:
+					connection.oos
+							.writeObject(new Packet(Type.ERROR,
+									"Login error. Please ensure client is up to date."));
+				}
+				if (!success)
+					loginPacket = (LoginPacket) connection.ois.readObject();
+			} while (!success);
+			connection.oos.writeObject(Packet.LOGIN_SUCCESSFUL);
+			selectCharacter();
+		}
+
+		/**
+		 * Prompts client to select character. Calls createCharacter() if user
+		 * has no characters.
+		 * 
+		 * @throws IOException
+		 * @throws ClassNotFoundException
+		 * 
+		 */
+		private void selectCharacter() throws IOException,
+				ClassNotFoundException {
+			List<Player> characters = connection.user.listCharacters();
+			if (!characters.isEmpty()) { // prompt client for character choice
+				do {
+					// send character list
+					connection.oos.writeObject(new Packet(
+							Type.CHARACTER_SELECT, characters.toString()));
+					Packet choice = (Packet) connection.ois.readObject();
+					if (choice.getType() == Type.CHARACTER_SELECT) {
+						String name = choice.getMessage();
+						// find character
+						for (Player p : characters)
+							if (p.getName().equalsIgnoreCase(name)) {
+								// store references
+								connection.player = p;
+								connections.put(p, connection);
+								playerLookup.put(name, p);
+								break;
+							}
+					} else if (choice.getType() == Type.DELETE_CHARACTER) {
+						deleteCharacter(choice);
+					}
+				} while (connection.player == null && !characters.isEmpty());
+				if (characters.isEmpty()) {
+					connection.oos.writeObject(new Packet(Type.SERVER_MESSAGE,
+							"Create a new character."));
+					while (!createCharacter())
+						; // create new character
+				}
+			}
+		}
+
+		/**
+		 * Creates a new character and associates it with this user's
+		 * connection.
+		 * 
+		 * @throws IOException
+		 * @throws ClassNotFoundException
+		 */
+		private boolean createCharacter() throws IOException,
+				ClassNotFoundException {
+			Packet create = (Packet) connection.ois.readObject();
+			int space = create.getMessage().indexOf(" ");
+			if (space < 2 || space > 14) {
+				connection.oos
+						.writeObject(new Packet(Type.ERROR,
+								"Please enter a name for your character between 2 and 15 characters long."));
+				return false;
+			}
+			String name = Names.formatName(create.getMessage().substring(0,
+					space));
+			String job = create.getMessage().substring(space + 1);
+			if (!Names.validateName(name)) {
+				connection.oos.writeObject(new Packet(Type.ERROR,
+						"Character names may only contain letters."));
+				return false;
+			}
+			Player created = connection.user.createNewCharacter(name,
+					Job.valueOf(job));
+			if (created == null)
+				return false;
+			connection.player = created;
+			connections.put(created, connection);
+			playerLookup.put(name, created);
+			return true;
+		}
+
+		/**
+		 * Called by selectCharacter(), this method attempts to remove a
+		 * character from a user's list of characters and from the server's list
+		 * of character names.
+		 * 
+		 * @throws IOException
+		 * 
+		 */
+		private void deleteCharacter(Packet choice) throws IOException {
+			for (Player p : connection.user.listCharacters())
+				if (p.getName().equalsIgnoreCase(choice.getMessage())) {
+					if (connection.user.deleteCharacter(p)) {
+						characterNameList.remove(p.getName());
+						connection.oos.writeObject(new Packet(
+								Type.SERVER_MESSAGE, choice.getMessage()
+										+ " deleted."));
+						return;
+					}
+				}
+			connection.oos.writeObject(new Packet(Type.SERVER_MESSAGE,
+					"Could not delete " + choice.getMessage() + "."));
+		}
+
+		/**
+		 * Tells the thread to close its associated stream.
+		 */
+		public void end() {
+			done = true;
+			try {
+				connection.ois.close();
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+		}
+
+		/**
+		 * Writes this thread's associated User to file and sets flag for this
+		 * thread to be dereferenced.
+		 */
+		private void cleanup() {
+			if (connection.user != null) {
+				try {
+					// first attempt
+					connection.user.save(false);
+				} catch (IOException e) {
+					e.printStackTrace();
+					try {
+						// second attempt
+						connection.user.save(true);
+					} catch (IOException e1) {
+						e1.printStackTrace();
+						System.out.println(connection.user.getUsername()
+								+ " file could not be saved!");
+					}
+				}
+				// clean up reference tables
+				usersOnline.remove(connection.user.getUsername());
+				if (connection.player != null) {
+					connections.remove(connection.player);
+					playerLookup.remove(connection.player.getName());
+				}
+			}
+			if (!done)
+				end();
+			needed = false;
+			threadFinished = true;
+		}
+	}
+
+	/**
+	 * ReporterThread serializes outgoing Packets.
+	 * 
+	 * Calling start() asks ReporterThread to begin sending output.
+	 * 
+	 * @author Daniel Eisenberg
+	 */
+	private class ReporterThread extends Thread {
+
+		private Connection connection;
+		private boolean done;
+
+		/**
+		 * ReporterThread constructor.
+		 * 
+		 * @param c
+		 *            - the connection for this ReporterThread.
+		 * 
+		 * @author Daniel Eisenberg
+		 */
+		public ReporterThread(Connection c) {
+			super();
+			connection = c;
+		}
+
+		public void run() {
+			while (true) {
+				try {
+					Packet p = connection.outputQueue.take();
+					if (p == Packet.POISON)
+						end();
+					connection.oos.writeObject(p);
+				} catch (InterruptedException e) {
+					interrupt();
+				} catch (IOException e) {
+					e.printStackTrace();
+					end();
+				} finally {
+					if (isInterrupted())
+						interrupted();
+				}
+			}
+		}
+
+		/**
+		 * Attempts to close this thread's stream and sets thread dereference
+		 * flag.
+		 */
+		public void end() {
+			done = true;
+			try {
+				connection.oos.close();
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+			threadFinished = true;
+		}
+	}
+
+	/**
+	 * EventThread takes Command objects from the eventQueue and executes them.
+	 * 
+	 * @author Daniel Eisenberg
+	 * 
+	 */
+	private class EventThread extends Thread {
+
+		/**
+		 * Takes Commands from eventQueue and executes them.
+		 */
+		public void run() {
+			while (!shuttingDown) {
+				try {
+					Command next = eventQueue.take();
+					next.execute();
+				} catch (InterruptedException e) {
+					interrupt();
+				} finally {
+					if (isInterrupted())
+						interrupted();
+				}
+			}
+		}
+	}
+
+	/**
+	 * Command object initiates server shutdown or restart.
+	 * 
+	 * @author Daniel Eisenberg
+	 * 
+	 */
+	private class ShutdownCommand extends Command {
+		private int minutes;
+		private boolean restart;
+
+		/**
+		 * Creates a shutdown command waiting the specified time in minutes (not
+		 * to exceed 15 minutes) before shutdown or restart.
+		 * 
+		 * @param mins
+		 *            - minutes until shutdown.
+		 * @param restart
+		 *            - if true, the server will restart.
+		 */
+		public ShutdownCommand(int mins, boolean restart) {
+			if (mins < 0)
+				minutes = 1;
+			else if (mins > 15)
+				minutes = 15;
+			else
+				minutes = mins;
+			this.restart = restart;
+		}
+
+		public void execute() {
+			if (!shutdownCommand) {
+				shutdownCommand = true;
+				shutdownThread = new Thread(new ShutdownTimer(minutes, restart));
+				shutdownThread.start();
+			}
+		}
+
+	}
+
+	/**
+	 * Thread for handling server shutdowns and restarts.
+	 * 
+	 * @author Daniel Eisenberg
+	 */
+	private class ShutdownTimer implements Runnable {
+
+		private int minutes;
+		private String event;
+		public boolean cancel;
+
+		/**
+		 * Creates a new ShutdownTimer which waits for the specified amount of
+		 * time. Server will always broadcast at least a 30 second warning, so
+		 * every shutdown takes at least 30 seconds.
+		 * 
+		 * @param mins
+		 *            - time in minutes until shutdown.
+		 * @param restart
+		 *            - if true, the server will restart.
+		 */
+		public ShutdownTimer(int mins, boolean restarting) {
+			minutes = mins;
+			event = (restarting) ? " restart " : " shutdown ";
+			cancel = false;
+			restart = restarting;
+		}
+
+		public void run() {
+			// broadcast every minute
+			for (int i = minutes; i > 0; i++)
+				try {
+					String message = "Server" + event + "in " + i + " minutes.";
+					eventQueue.put(new Broadcast(new Packet(
+							Type.SERVER_BROADCAST, message)));
+					System.out.println(message);
+					if (i > 1)
+						synchronized (this) {
+							wait(60000L);
+						}
+				} catch (InterruptedException e) {
+					if (cancel) {
+						eventQueue.add(new Broadcast(new Packet(
+								Type.SERVER_BROADCAST, "Shutdown aborted.")));
+						System.out.println("Shutdown aborted.");
+						shutdownCommand = false;
+						return;
+					}
+				}
+			// broadcast at 30s to shutdown
+			try {
+				String message = "Server" + event + "in " + "30 seconds.";
+				eventQueue.put(new Broadcast(new Packet(Type.SERVER_BROADCAST,
+						message)));
+				System.out.println(message);
+				synchronized (this) {
+					wait(30000L);
+				}
+			} catch (InterruptedException e) {
+				if (cancel) {
+					eventQueue.add(new Broadcast(new Packet(
+							Type.SERVER_BROADCAST, "Shutdown aborted.")));
+					System.out.println("Shutdown aborted.");
+					shutdownCommand = false;
+					return;
+				}
+			}
+
+			// shutdown server
+			shuttingDown = true;
+			try {
+				serverSocket.close();
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+		}
+	}
+
+	/**
+	 * MobActionThread iterates through creatures and calls their action
+	 * methods.
+	 * 
+	 * @author Daniel Eisenberg
+	 * 
+	 */
+	private class MobActionThread extends Thread {
+
+		public void run() {
+			while (!shuttingDown) {
+				for (Dungeon d : world.listDungeons())
+					for (Room r : d.listRooms())
+						for (Mob m : r.listCreatures())
+							try {
+								if (m.ready())
+									eventQueue.put(new MobCommand(m));
+							} catch (InterruptedException e) {
+								interrupt();
+							} finally {
+								if (isInterrupted())
+									interrupted();
+							}
+			}
+		}
+	}
+
+	/**
+	 * Thread handles local server commands.
+	 * 
+	 * @author Daniel Eisenberg
+	 * 
+	 */
+	private class ConsoleThread extends Thread {
+
+		public void run() {
+			Scanner kb = new Scanner(System.in);
+			while (true) {
+				String input = kb.next();
+				String next = null;
+				Integer n = 0;
+				Type which = null;
+
+				if (input.equalsIgnoreCase("SHUTDOWN")
+						|| input.equalsIgnoreCase("RESTART")) {
+					which = Type.valueOf(input.toUpperCase());
+					if (kb.hasNext()) {
+						next = kb.next();
+						try {
+							n = Integer.parseInt(next);
+						} catch (NumberFormatException nfe) {
+							// ignore
+						}
+					}
+					if (which != null)
+						try {
+							eventQueue.put(new ShutdownCommand(n,
+									which == Type.RESTART));
+						} catch (InterruptedException e) {
+							System.out.println("Action may have failed.");
+						}
+				}
+			}
+		}
+	}
+}
